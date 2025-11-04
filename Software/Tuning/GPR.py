@@ -108,7 +108,8 @@ def Print_ErrorRate(ErrorRate: dict[str,float]) -> None:
 def main():
     # TopFeatures = ['Median', 'Percentile_75', 't1/tpi', 'mfcc_2', 'tpp', 'sys_amp', 'tpi', 'InterquartileRange', 'mfcc_8', 'mfcc_6', 'foot_amp']
     TopFeatures = ['Median', 'Percentile_75', 'mean(t1/tpi)', 'mfcc_2', 'mean(tpp)', 'mean(sys_amp)', 'mean(tpi)', 'InterquartileRange', 'mfcc_8', 'mfcc_6', 'mean(foot_amp)']
-    targetName = "SpO2(mean)"
+    # targetName = "SpO2(mean)" # "RR(mean)"
+    targetName = "RR(mean)"
     input_csv = "BIDMC_Regression/features/BIDMC_Segmented_features.csv"
     output_dir = "BIDMC_Regression/features"
     # ErrorRate = Run_GPR(input_csv, output_dir, targetName, TopFeatures)

@@ -1,7 +1,9 @@
 '''
 This script is used to predict future SpO2 and RR for multiple time windows
+Using Transformer Encoder to extract features from PPG sequences + XGBoost for predictions
 Author: Ruijia Chang
 Date: 2025-09-28
+Edited: 2025-10-27
 '''
 
 import pandas as pd
@@ -15,20 +17,134 @@ from xgboost import XGBRegressor
 import joblib
 import os
 
+# PyTorch for Transformer
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+class PPGSequenceDataset(Dataset):
+    """Dataset for PPG sequences"""
+    def __init__(self, sequences, targets=None):
+        self.sequences = sequences  # Shape: (n_samples, seq_len, n_features)
+        self.targets = targets  # Shape: (n_samples, n_targets) or None
+        
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        sequence = torch.FloatTensor(self.sequences[idx])
+        if self.targets is not None:
+            target = torch.FloatTensor(self.targets[idx])
+            return sequence, target
+        return sequence
+
+class TransformerEncoder(nn.Module):
+    """
+    Transformer Encoder for processing PPG sequences
+    """
+    def __init__(self, input_dim, embed_dim=128, num_heads=8, num_layers=3, 
+                 feedforward_dim=512, dropout=0.1, max_seq_len=60):
+        super(TransformerEncoder, self).__init__()
+        
+        self.embed_dim = embed_dim
+        self.input_dim = input_dim
+        
+        # Input projection
+        self.input_projection = nn.Linear(input_dim, embed_dim)
+        
+        # Positional encoding
+        self.pos_encoding = nn.Parameter(
+            torch.randn(max_seq_len, embed_dim)
+        )
+        
+        # Transformer encoder layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=feedforward_dim,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers
+        )
+        
+        # Pooling layers (for sequence to vector)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        """
+        Forward pass
+        
+        Args:
+            x: Input sequence (batch_size, seq_len, input_dim)
+        
+        Returns:
+            embedding: Sequence embedding (batch_size, embed_dim)
+        """
+        batch_size, seq_len, _ = x.size()
+        
+        # Project to embedding dimension
+        x = self.input_projection(x)
+        
+        # Add positional encoding
+        x = x + self.pos_encoding[:seq_len, :].unsqueeze(0)
+        
+        # Apply dropout
+        x = self.dropout(x)
+        
+        # Transformer encoding
+        x = self.transformer(x)
+        
+        # Global average pooling (CLS token style)
+        # x shape: (batch, seq_len, embed_dim)
+        x = x.transpose(1, 2)  # (batch, embed_dim, seq_len)
+        x = self.pool(x).squeeze(-1)  # (batch, embed_dim)
+        
+        return x
+
 class MultiWindowFuturePrediction:
     """
     Multi-window future prediction model for SpO2 and RR
     """
     
-    def __init__(self, future_offsets=[10, 20, 30, 40, 50, 60]):
+    def __init__(self, future_offsets=[10, 20, 30, 40, 50, 60, 90, 120, 180, 240, 300], 
+                 seq_len=60, use_transformer=True,
+                 embed_dim=128, num_heads=8, num_layers=3):
         """
-        Initialize multi-window future prediction model
+        Initialize multi-window future prediction model with Transformer
         
         Args:
             future_offsets: List of prediction time offsets in seconds
+            seq_len: Length of PPG sequence to use for input
+            use_transformer: Whether to use Transformer encoder
+            embed_dim: Transformer embedding dimension
+            num_heads: Number of attention heads
+            num_layers: Number of transformer encoder layers
         """
         self.future_offsets = sorted(future_offsets)
         self.max_offset = max(self.future_offsets)
+        self.seq_len = seq_len
+        self.use_transformer = use_transformer
+        
+        # Transformer parameters
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.num_layers = num_layers
+        
+        # Store Transformer model
+        self.transformer = None
+        self.input_dim = None
         
         # Store models for each time window
         self.models_spo2 = {}
@@ -39,7 +155,7 @@ class MultiWindowFuturePrediction:
         
     def prepare_training_data(self, input_csv):
         """
-        Prepare training data for multiple time windows: historical PPG features → future SpO2/RR
+        Prepare training data with PPG sequences for multiple time windows
         
         Args:
             input_csv: Input feature file path
@@ -74,75 +190,191 @@ class MultiWindowFuturePrediction:
         df['SpO2_momentum'] = df['SpO2(mean)'].diff(2).fillna(0)
         df['RR_momentum'] = df['RR(mean)'].diff(2).fillna(0)
         
+        # Get feature columns (exclude SpO2 and RR as they are targets)
+        exclude_cols = ['SpO2(mean)', 'RR(mean)']
+        feature_cols = [col for col in df.columns if col not in exclude_cols]
+        
+        # Store feature names for later use
+        self.feature_names = feature_cols
+        self.input_dim = len(feature_cols)
+        print(f"Number of features: {self.input_dim}")
+        
         # Prepare training data for each time window
         training_data = {}
         
         for offset in self.future_offsets:
             print(f"Preparing data for {offset}s prediction...")
             
-            X = []  # Input features
+            X_sequences = []  # Input PPG sequences
             y_spo2 = []  # Future SpO2 targets
             y_rr = []    # Future RR targets
             
-            # Ensure sufficient data for future prediction
-            max_index = len(df) - offset
+            # Ensure sufficient data for sequence + future prediction
+            max_index = len(df) - max(offset, self.seq_len)
             
             for i in range(max_index):
-                # Create enhanced features with historical context
-                current_features = df.iloc[i].to_dict()
+                # Create sequence from historical data
+                start_idx = max(0, i - self.seq_len + 1)
+                sequence_data = df.iloc[start_idx:i+1][feature_cols].values
                 
-            # Use enhanced features without historical lag features for simplicity
+                # Pad if sequence is shorter than seq_len
+                if len(sequence_data) < self.seq_len:
+                    padding = np.zeros((self.seq_len - len(sequence_data), len(feature_cols)))
+                    sequence_data = np.vstack([padding, sequence_data])
                 
-                # Output: future moment target values
+                # Get future targets
                 future_row = df.iloc[i + offset]
                 future_spo2 = future_row['SpO2(mean)']
                 future_rr = future_row['RR(mean)']
                 
-                X.append(current_features)
+                X_sequences.append(sequence_data)
                 y_spo2.append(future_spo2)
                 y_rr.append(future_rr)
             
             training_data[offset] = {
-                'X': X,
+                'X': X_sequences,
                 'y_spo2': y_spo2,
                 'y_rr': y_rr
             }
             
-            print(f"  {offset}s samples: {len(X)}")
+            print(f"  {offset}s samples: {len(X_sequences)}")
             print(f"  SpO2 range: {min(y_spo2):.2f} - {max(y_spo2):.2f}")
             print(f"  RR range: {min(y_rr):.2f} - {max(y_rr):.2f}")
         
         return training_data
     
+    def _train_transformer(self, all_sequences):
+        """
+        Train the Transformer encoder on all PPG sequences
+        
+        Args:
+            all_sequences: List of all sequences from training data
+        """
+        print("Training Transformer encoder...")
+        
+        # Initialize Transformer
+        self.transformer = TransformerEncoder(
+            input_dim=self.input_dim,
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            num_layers=self.num_layers
+        ).to(device)
+        
+        # For this implementation, we'll use the Transformer in a self-supervised way
+        # or train it as a feature extractor with reconstruction loss
+        optimizer = optim.Adam(self.transformer.parameters(), lr=0.001)
+        criterion = nn.MSELoss()
+        
+        # Create dataset
+        X = np.array(all_sequences)
+        dataset = PPGSequenceDataset(X)
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+        
+        # Add a reconstruction head for training
+        reconstruction_head = nn.Sequential(
+            nn.Linear(self.embed_dim, self.input_dim * self.seq_len)
+        ).to(device)
+        
+        optimizer_full = optim.Adam(
+            list(self.transformer.parameters()) + list(reconstruction_head.parameters()),
+            lr=0.001
+        )
+        
+        # Train for a few epochs to learn representations
+        n_epochs = 15
+        self.transformer.train()
+        reconstruction_head.train()
+        
+        for epoch in range(n_epochs):
+            total_loss = 0
+            for batch in dataloader:
+                batch = batch.to(device)
+                batch_size, seq_len, n_features = batch.shape
+                
+                # Forward pass through transformer
+                embeddings = self.transformer(batch)
+                
+                # Reconstruct sequence from embedding
+                reconstructed = reconstruction_head(embeddings)
+                reconstructed = reconstructed.view(batch_size, self.seq_len, n_features)
+                
+                # Reconstruction loss
+                reconstruction_loss = criterion(reconstructed, batch)
+                
+                # L2 regularization on embeddings to prevent overfitting
+                l2_reg = 0.001 * torch.mean(embeddings ** 2)
+                
+                loss = reconstruction_loss + l2_reg
+        
+                optimizer_full.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.transformer.parameters(), 1.0)
+                optimizer_full.step()
+                
+                total_loss += loss.item()
+            
+            print(f"  Epoch {epoch+1}/{n_epochs}, Loss: {total_loss/len(dataloader):.4f}")
+        
+        self.transformer.eval()
+        print("Transformer encoder trained!")
+    
+    def _extract_embeddings(self, sequences):
+        """
+        Extract embeddings from sequences using the Transformer
+        
+        Args:
+            sequences: Input sequences (n_samples, seq_len, n_features)
+        
+        Returns:
+            numpy array: Embeddings (n_samples, embed_dim)
+        """
+        self.transformer.eval()
+        
+        X = np.array(sequences)
+        dataset = PPGSequenceDataset(X)
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
+        
+        embeddings_list = []
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                batch = batch.to(device)
+                embeddings = self.transformer(batch)
+                embeddings_list.append(embeddings.cpu().numpy())
+        
+        return np.vstack(embeddings_list)
+    
     def train(self, training_data):
         """
-        Train multi-window future prediction models with adaptive parameters
+        Train Transformer + XGBoost multi-window future prediction models
         
         Args:
             training_data: Dictionary containing training data for each time window
         """
-        print("Starting multi-window future prediction model training...")
+        print("Starting multi-window future prediction model training with Transformer...")
         
-        # Use the first time window to determine feature names and scaler
-        first_offset = self.future_offsets[0]
-        X_first = pd.DataFrame(training_data[first_offset]['X'])
-        self.feature_names = list(X_first.columns)
-        
-        # For tree-based models (XGBoost), scaling is not required
-        self.scaler = None
-        
-        # Train models for each time window with adaptive parameters
+        # Collect all sequences for Transformer training
+        all_sequences = []
         for offset in self.future_offsets:
-            print(f"Training models for {offset}s prediction...")
+            all_sequences.extend(training_data[offset]['X'])
+        
+        # Train Transformer encoder
+        self._train_transformer(all_sequences)
+        
+        # Extract embeddings and train XGBoost models for each time window
+        for offset in self.future_offsets:
+            print(f"Training XGBoost models for {offset}s prediction...")
             
-            # Prepare data
-            X = pd.DataFrame(training_data[offset]['X'])
+            # Extract embeddings
+            X_sequences = training_data[offset]['X']
+            X_embeddings = self._extract_embeddings(X_sequences)
+            
             y_spo2 = training_data[offset]['y_spo2']
             y_rr = training_data[offset]['y_rr']
             
             # Adaptive XGBoost parameters based on prediction window
             if offset <= 20:
-                # Short-term prediction: faster learning, less regularization
+                # Very short-term prediction (10-20s): faster learning, less regularization
                 xgb_params = dict(
                     n_estimators=500,
                     max_depth=5,
@@ -156,7 +388,7 @@ class MultiWindowFuturePrediction:
                     n_jobs=-1
                 )
             elif offset <= 40:
-                # Medium-term prediction: balanced parameters
+                # Short-term prediction (30-40s): balanced parameters
                 xgb_params = dict(
                     n_estimators=600,
                     max_depth=4,
@@ -169,15 +401,43 @@ class MultiWindowFuturePrediction:
                     tree_method='hist',
                     n_jobs=-1
                 )
-            else:
-                # Long-term prediction: more regularization, slower learning
+            elif offset <= 60:
+                # Medium-term prediction (50-60s): more regularization
+                xgb_params = dict(
+                    n_estimators=700,
+                    max_depth=4,
+                    learning_rate=0.05,
+                    subsample=0.75,
+                    colsample_bytree=0.75,
+                    reg_lambda=1.5,
+                    objective='reg:squarederror',
+                    random_state=42,
+                    tree_method='hist',
+                    n_jobs=-1
+                )
+            elif offset <= 120:
+                # Long-term prediction (90-120s): strong regularization
                 xgb_params = dict(
                     n_estimators=800,
                     max_depth=3,
                     learning_rate=0.04,
                     subsample=0.7,
                     colsample_bytree=0.7,
-                    reg_lambda=2.0,
+                    reg_lambda=2.5,
+                    objective='reg:squarederror',
+                    random_state=42,
+                    tree_method='hist',
+                    n_jobs=-1
+                )
+            else:
+                # Very long-term prediction (180s+, 3-5 minutes): maximum regularization
+                xgb_params = dict(
+                    n_estimators=1000,
+                    max_depth=3,
+                    learning_rate=0.03,
+                    subsample=0.65,
+                    colsample_bytree=0.65,
+                    reg_lambda=3.0,
                     objective='reg:squarederror',
                     random_state=42,
                     tree_method='hist',
@@ -187,9 +447,9 @@ class MultiWindowFuturePrediction:
             model_spo2 = XGBRegressor(**xgb_params)
             model_rr = XGBRegressor(**xgb_params)
             
-            # Train models
-            model_spo2.fit(X.values, y_spo2)
-            model_rr.fit(X.values, y_rr)
+            # Train XGBoost models using Transformer embeddings
+            model_spo2.fit(X_embeddings, y_spo2)
+            model_rr.fit(X_embeddings, y_rr)
             
             # Store models
             self.models_spo2[offset] = model_spo2
@@ -198,14 +458,14 @@ class MultiWindowFuturePrediction:
             print(f"  {offset}s models trained successfully")
         
         self.is_trained = True
-        print("Multi-window model training completed!")
+        print("Multi-window Transformer+XGBoost model training completed!")
     
-    def predict(self, current_features):
+    def predict(self, current_sequence):
         """
-        Predict future SpO2 and RR for all time windows
+        Predict future SpO2 and RR for all time windows using Transformer embeddings
         
         Args:
-            current_features: Current moment features
+            current_sequence: Current PPG sequence (seq_len, n_features) or list of features
         
         Returns:
             dict: Prediction results for all time windows
@@ -213,33 +473,46 @@ class MultiWindowFuturePrediction:
         if not self.is_trained:
             raise ValueError("Model not trained yet!")
         
-        # Predict for all time windows
+        # Convert input to sequence if needed
+        if isinstance(current_sequence, (list, dict)):
+            # If single feature vector, convert to sequence
+            if isinstance(current_sequence, dict):
+                # Extract features in correct order
+                feature_values = [current_sequence.get(f, 0.0) for f in self.feature_names]
+            else:
+                feature_values = current_sequence
+            
+            # Create sequence by repeating the current features
+            sequence = np.tile(feature_values, (self.seq_len, 1))
+        else:
+            sequence = np.array(current_sequence)
+        
+        # Ensure correct shape
+        if sequence.ndim == 1:
+            sequence = sequence.reshape(1, -1)
+        if sequence.shape[0] != self.seq_len:
+            # Pad or truncate to seq_len
+            if sequence.shape[0] < self.seq_len:
+                padding = np.zeros((self.seq_len - sequence.shape[0], sequence.shape[1]))
+                sequence = np.vstack([padding, sequence])
+            else:
+                sequence = sequence[-self.seq_len:]
+        
+        # Extract embedding using Transformer
+        sequence_tensor = torch.FloatTensor(sequence).unsqueeze(0).to(device)
+        self.transformer.eval()
+        
+        with torch.no_grad():
+            embedding = self.transformer(sequence_tensor)
+            embedding = embedding.cpu().numpy()
+        
+        # Predict for all time windows using XGBoost
         predictions = {}
         
         for offset in self.future_offsets:
-            # Use feature selection - only features that exist in training
-            selected_features = {k: v for k, v in current_features.items() 
-                               if k in self.feature_names}
-            
-            # Fill missing features with default values
-            for feature in self.feature_names:
-                if feature not in selected_features:
-                    selected_features[feature] = 0.0
-            
-            # Convert to DataFrame
-            features_df = pd.DataFrame([selected_features])
-            
-            # Ensure correct column order
-            features_df = features_df[self.feature_names]
-            
-            # No scaling for XGBoost
-            X_input = features_df.values
-            
-            # Prediction for all models
-            spo2_pred = float(self.models_spo2[offset].predict(X_input)[0])
-            rr_pred = float(self.models_rr[offset].predict(X_input)[0])
-            spo2_std = None
-            rr_std = None
+            # Prediction using Transformer embeddings
+            spo2_pred = float(self.models_spo2[offset].predict(embedding)[0])
+            rr_pred = float(self.models_rr[offset].predict(embedding)[0])
             
             # Apply physiological constraints
             spo2_pred = np.clip(spo2_pred, 70, 100)
@@ -248,8 +521,8 @@ class MultiWindowFuturePrediction:
             predictions[offset] = {
                 'future_spo2': spo2_pred,
                 'future_rr': rr_pred,
-                'confidence_spo2': spo2_std,
-                'confidence_rr': rr_std
+                'confidence_spo2': None,
+                'confidence_rr': None
             }
         
         return predictions
@@ -273,13 +546,16 @@ class MultiWindowFuturePrediction:
             print(f"Evaluating {offset}s prediction...")
             
             # Prepare test data
-            X_test = pd.DataFrame(test_data[offset]['X'])
+            X_sequences = test_data[offset]['X']
             y_spo2_test = test_data[offset]['y_spo2']
             y_rr_test = test_data[offset]['y_rr']
             
-            # Predict (no scaling required)
-            spo2_pred = self.models_spo2[offset].predict(X_test.values)
-            rr_pred = self.models_rr[offset].predict(X_test.values)
+            # Extract embeddings using Transformer
+            X_test_embeddings = self._extract_embeddings(X_sequences)
+            
+            # Predict using Transformer embeddings + XGBoost
+            spo2_pred = self.models_spo2[offset].predict(X_test_embeddings)
+            rr_pred = self.models_rr[offset].predict(X_test_embeddings)
             
             # Calculate evaluation metrics
             spo2_mae = mean_absolute_error(y_spo2_test, spo2_pred)
@@ -309,7 +585,7 @@ class MultiWindowFuturePrediction:
     
     def save_model(self, filepath):
         """
-        Save trained multi-window model
+        Save trained multi-window model including Transformer
         """
         if not self.is_trained:
             raise ValueError("Model not trained yet!")
@@ -321,15 +597,25 @@ class MultiWindowFuturePrediction:
             'models_rr': self.models_rr,
             'scaler': self.scaler,
             'feature_names': self.feature_names,
-            'is_trained': self.is_trained
+            'is_trained': self.is_trained,
+            'seq_len': self.seq_len,
+            'use_transformer': self.use_transformer,
+            'embed_dim': self.embed_dim,
+            'num_heads': self.num_heads,
+            'num_layers': self.num_layers,
+            'input_dim': self.input_dim
         }
         
+        # Save Transformer state separately
+        if self.use_transformer and self.transformer is not None:
+            model_data['transformer_state'] = self.transformer.state_dict()
+        
         joblib.dump(model_data, filepath)
-        print(f"Multi-window model saved to: {filepath}")
+        print(f"Multi-window Transformer+XGBoost model saved to: {filepath}")
     
     def load_model(self, filepath):
         """
-        Load trained multi-window model
+        Load trained multi-window model including Transformer
         """
         model_data = joblib.load(filepath)
         
@@ -340,17 +626,36 @@ class MultiWindowFuturePrediction:
         self.scaler = model_data['scaler']
         self.feature_names = model_data['feature_names']
         self.is_trained = model_data['is_trained']
+        self.seq_len = model_data.get('seq_len', 60)
+        self.use_transformer = model_data.get('use_transformer', True)
         
-        print(f"Multi-window model loaded from {filepath}")
+        # Load Transformer if present
+        if 'transformer_state' in model_data:
+            self.embed_dim = model_data.get('embed_dim', 128)
+            self.num_heads = model_data.get('num_heads', 8)
+            self.num_layers = model_data.get('num_layers', 3)
+            self.input_dim = model_data.get('input_dim', len(self.feature_names))
+            
+            self.transformer = TransformerEncoder(
+                input_dim=self.input_dim,
+                embed_dim=self.embed_dim,
+                num_heads=self.num_heads,
+                num_layers=self.num_layers
+            ).to(device)
+            self.transformer.load_state_dict(model_data['transformer_state'])
+            self.transformer.eval()
+        
+        print(f"Multi-window Transformer+XGBoost model loaded from {filepath}")
 
 def main():
     """
-    Main function: demonstrate multi-window future prediction
+    Main function: demonstrate multi-window future prediction with Transformer + XGBoost
     """
-    print("=== Multi-Window Future Prediction Demo ===")
+    print("=== Multi-Window Future Prediction with Transformer + XGBoost ===")
     
     # Set parameters
-    future_offsets = [10, 20, 30, 40, 50, 60]  # Multiple prediction time windows
+    # Extended time windows: 10-60s (short-term), 90-300s (medium to long-term)
+    future_offsets = [10, 20, 30, 40, 50, 60, 90, 120, 180, 240, 300]
     input_csv = "BIDMC_Regression/features/BIDMC_Segmented_features.csv"
     
     # Check if file exists
@@ -485,8 +790,8 @@ def main():
             print(f"    True RR: {true_rr:.2f} breaths/min (error: {abs(true_rr - pred['future_rr']):.2f})")
             print()
     
-    # Save model
-    model_path = f"multi_window_prediction_model_{'-'.join(map(str, future_offsets))}s.pkl"
+    # Save model with a concise name
+    model_path = f"transformer_xgboost_model_extended_10-300s.pkl"
     model.save_model(model_path)
     
     print(f"\n=== Done ===")

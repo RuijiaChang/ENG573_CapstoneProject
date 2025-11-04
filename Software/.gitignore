@@ -1,0 +1,5 @@
+*.pkl
+*.zip
+
+Software/Data/
+Software/Backup/
