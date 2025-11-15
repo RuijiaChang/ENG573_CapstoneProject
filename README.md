@@ -1,4 +1,4 @@
-## **Project Overview**
+## **Wearable Spo2 RR Forecasting**
 
 This project aims to develop a wrist-wearable prediction system based on photoplethysmography (PPG) signals for the early detection of **Opioid-Induced Respiratory Depression (OIRD)**. The long-term goal is to build an integrated wearable platform that combines **hardware sensing** and **software prediction modules**, enabling real-time and multi-horizon forecasting of **blood oxygen saturation (SpO₂)** and **respiratory rate (RR)** to support continuous patient monitoring and timely clinical intervention.
 
